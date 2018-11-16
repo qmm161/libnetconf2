@@ -15,6 +15,8 @@
 #ifndef NC_SESSION_H_
 #define NC_SESSION_H_
 
+#include "netconf.h"
+
 #ifdef NC_ENABLED_SSH
 
 /**
@@ -49,6 +51,7 @@ typedef enum {
  * @brief Enumeration of possible session statuses
  */
 typedef enum {
+    NC_STATUS_ERR = -1,   /**< error return code for function getting the session status */
     NC_STATUS_STARTING = 0, /**< session is not yet fully initiated */
     NC_STATUS_CLOSING,      /**< session is being closed */
     NC_STATUS_INVALID,      /**< session is not running and is supposed to be closed (nc_session_free()) */
@@ -71,6 +74,33 @@ typedef enum {
 } NC_TRANSPORT_IMPL;
 
 /**
+ * @brief Enumeration of Call Home connection types.
+ */
+typedef enum {
+    NC_CH_CT_NOT_SET = 0,
+    NC_CH_PERSIST,
+    NC_CH_PERIOD
+} NC_CH_CONN_TYPE;
+
+/**
+ * @brief Enumeration of Call Home client priority policy.
+ */
+typedef enum {
+    NC_CH_FIRST_LISTED = 0, //default
+    NC_CH_LAST_CONNECTED
+} NC_CH_START_WITH;
+
+/**
+ * @brief Enumeration of SSH key types.
+ */
+typedef enum {
+    NC_SSH_KEY_UNKNOWN = 0,
+    NC_SSH_KEY_DSA,
+    NC_SSH_KEY_RSA,
+    NC_SSH_KEY_ECDSA
+} NC_SSH_KEY_TYPE;
+
+/**
  * @brief NETCONF session object
  */
 struct nc_session;
@@ -82,6 +112,22 @@ struct nc_session;
  * @return Session status.
  */
 NC_STATUS nc_session_get_status(const struct nc_session *session);
+
+/**
+ * @brief Get session termination reason.
+ *
+ * @param[in] session Session to get the information from.
+ * @return Session termination reason enum value.
+ */
+NC_SESSION_TERM_REASON nc_session_get_term_reason(const struct nc_session *session);
+
+/**
+ * @brief Get session killer session ID.
+ *
+ * @param[in] session Session to get the information from.
+ * @return Session killer ID.
+ */
+uint32_t nc_session_get_killed_by(const struct nc_session *session);
 
 /**
  * @brief Get session ID.
@@ -162,5 +208,19 @@ void *nc_session_get_data(const struct nc_session *session);
  * @param[in] data_free Session user data destructor.
  */
 void nc_session_free(struct nc_session *session, void (*data_free)(void *));
+
+#if defined(NC_ENABLED_SSH) || defined(NC_ENABLED_TLS)
+
+/**
+ * @brief Free all the dynamically allocated thread-specific libssl/libcrypto
+ * resources.
+ *
+ * This function should be called only if init (nc_client_init(), respectively nc_server_init()) was called.
+ * Call it in every thread your application creates just before the thread exits. In the last thread
+ * (usually the main one) call nc_client_destroy(), respectively nc_server_destroy().
+ */
+void nc_thread_destroy(void);
+
+#endif /* NC_ENABLED_SSH || NC_ENABLED_TLS */
 
 #endif /* NC_SESSION_H_ */

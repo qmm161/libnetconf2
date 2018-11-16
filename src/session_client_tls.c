@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <libyang/libyang.h>
+#include <openssl/ossl_typ.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
 
@@ -28,11 +29,112 @@
 #include "session_client_ch.h"
 #include "libnetconf.h"
 
-extern struct nc_client_opts client_opts;
-static struct nc_client_tls_opts tls_opts;
-static struct nc_client_tls_opts tls_ch_opts;
+struct nc_client_context *nc_client_context_location(void);
+int nc_session_new_ctx( struct nc_session *session, struct ly_ctx *ctx);
+
+#define client_opts nc_client_context_location()->opts
+#define tls_opts nc_client_context_location()->tls_opts
+#define tls_ch_opts nc_client_context_location()->tls_ch_opts
 
 static int tlsauth_ch;
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L // >= 1.1.0
+
+static int
+tlsauth_verify_callback(int preverify_ok, X509_STORE_CTX *x509_ctx)
+{
+    X509_STORE_CTX *store_ctx;
+    X509_OBJECT *obj;
+    X509_NAME *subject, *issuer;
+    X509 *cert;
+    X509_CRL *crl;
+    X509_REVOKED *revoked;
+    EVP_PKEY *pubkey;
+    int i, n, rc;
+    const ASN1_TIME *next_update = NULL;
+    struct nc_client_tls_opts *opts;
+
+    if (!preverify_ok) {
+        return 0;
+    }
+
+    opts = (tlsauth_ch ? &tls_ch_opts : &tls_opts);
+
+    if (!opts->crl_store) {
+        /* nothing to check */
+        return 1;
+    }
+
+    cert = X509_STORE_CTX_get_current_cert(x509_ctx);
+    subject = X509_get_subject_name(cert);
+    issuer = X509_get_issuer_name(cert);
+
+    /* try to retrieve a CRL corresponding to the _subject_ of
+     * the current certificate in order to verify it's integrity */
+    store_ctx = X509_STORE_CTX_new();
+    obj = X509_OBJECT_new();
+    X509_STORE_CTX_init(store_ctx, opts->crl_store, NULL, NULL);
+    rc = X509_STORE_get_by_subject(store_ctx, X509_LU_CRL, subject, obj);
+    X509_STORE_CTX_free(store_ctx);
+    crl = X509_OBJECT_get0_X509_CRL(obj);
+    if (rc > 0 && crl) {
+        next_update = X509_CRL_get0_nextUpdate(crl);
+
+        /* verify the signature on this CRL */
+        pubkey = X509_get_pubkey(cert);
+        if (X509_CRL_verify(crl, pubkey) <= 0) {
+            X509_STORE_CTX_set_error(x509_ctx, X509_V_ERR_CRL_SIGNATURE_FAILURE);
+            X509_OBJECT_free(obj);
+            if (pubkey) {
+                EVP_PKEY_free(pubkey);
+            }
+            return 0; /* fail */
+        }
+        if (pubkey) {
+            EVP_PKEY_free(pubkey);
+        }
+
+        /* check date of CRL to make sure it's not expired */
+        if (!next_update) {
+            X509_STORE_CTX_set_error(x509_ctx, X509_V_ERR_ERROR_IN_CRL_NEXT_UPDATE_FIELD);
+            X509_OBJECT_free(obj);
+            return 0; /* fail */
+        }
+        if (X509_cmp_current_time(next_update) < 0) {
+            X509_STORE_CTX_set_error(x509_ctx, X509_V_ERR_CRL_HAS_EXPIRED);
+            X509_OBJECT_free(obj);
+            return 0; /* fail */
+        }
+        X509_OBJECT_free(obj);
+    }
+
+    /* try to retrieve a CRL corresponding to the _issuer_ of
+     * the current certificate in order to check for revocation */
+    store_ctx = X509_STORE_CTX_new();
+    obj = X509_OBJECT_new();
+    X509_STORE_CTX_init(store_ctx, opts->crl_store, NULL, NULL);
+    rc = X509_STORE_get_by_subject(store_ctx, X509_LU_CRL, issuer, obj);
+    X509_STORE_CTX_free(store_ctx);
+    crl = X509_OBJECT_get0_X509_CRL(obj);
+    if (rc > 0 && crl) {
+        /* check if the current certificate is revoked by this CRL */
+        n = sk_X509_REVOKED_num(X509_CRL_get_REVOKED(crl));
+        for (i = 0; i < n; i++) {
+            revoked = sk_X509_REVOKED_value(X509_CRL_get_REVOKED(crl), i);
+            if (ASN1_INTEGER_cmp(X509_REVOKED_get0_serialNumber(revoked), X509_get_serialNumber(cert)) == 0) {
+                ERR("Certificate revoked!");
+                X509_STORE_CTX_set_error(x509_ctx, X509_V_ERR_CERT_REVOKED);
+                X509_OBJECT_free(obj);
+                return 0; /* fail */
+            }
+        }
+        X509_OBJECT_free(obj);
+    }
+
+    return 1; /* success */
+}
+
+#else
 
 static int
 tlsauth_verify_callback(int preverify_ok, X509_STORE_CTX *x509_ctx)
@@ -126,6 +228,8 @@ tlsauth_verify_callback(int preverify_ok, X509_STORE_CTX *x509_ctx)
     return 1; /* success */
 }
 
+#endif
+
 static void
 _nc_client_tls_destroy_opts(struct nc_client_tls_opts *opts)
 {
@@ -138,6 +242,8 @@ _nc_client_tls_destroy_opts(struct nc_client_tls_opts *opts)
     free(opts->crl_file);
     free(opts->crl_dir);
     X509_STORE_free(opts->crl_store);
+
+    memset(opts, 0, sizeof *opts);
 }
 
 void
@@ -392,8 +498,14 @@ nc_client_tls_update_opts(struct nc_client_tls_opts *opts)
     if (!opts->tls_ctx || opts->tls_ctx_change) {
         SSL_CTX_free(opts->tls_ctx);
 
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L // >= 1.1.0
+        /* prepare global SSL context, highest available method is negotiated autmatically  */
+        if (!(opts->tls_ctx = SSL_CTX_new(TLS_client_method())))
+#else
         /* prepare global SSL context, allow only mandatory TLS 1.2  */
-        if (!(opts->tls_ctx = SSL_CTX_new(TLSv1_2_client_method()))) {
+        if (!(opts->tls_ctx = SSL_CTX_new(TLSv1_2_client_method())))
+#endif
+        {
             ERR("Unable to create OpenSSL context (%s).", ERR_reason_error_string(ERR_get_error()));
             return -1;
         }
@@ -431,7 +543,11 @@ nc_client_tls_update_opts(struct nc_client_tls_opts *opts)
             ERR("Unable to create a certificate store (%s).", ERR_reason_error_string(ERR_get_error()));
             return -1;
         }
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L // < 1.1.0
+        /* whaveter this does... */
         opts->crl_store->cache = 0;
+#endif
 
         if (opts->crl_file) {
             if (!(lookup = X509_STORE_add_lookup(opts->crl_store, X509_LOOKUP_file()))) {
@@ -464,7 +580,7 @@ nc_connect_tls(const char *host, unsigned short port, struct ly_ctx *ctx)
 {
     struct nc_session *session = NULL;
     int sock, verify, ret;
-    uint32_t elapsed_usec = 0;
+    struct timespec ts_timeout, ts_cur;
 
     if (!tls_opts.cert_path || (!tls_opts.ca_file && !tls_opts.ca_dir)) {
         ERRINIT;
@@ -486,21 +602,12 @@ nc_connect_tls(const char *host, unsigned short port, struct ly_ctx *ctx)
     }
 
     /* prepare session structure */
-    session = calloc(1, sizeof *session);
+    session = nc_new_session(NC_CLIENT, 0);
     if (!session) {
         ERRMEM;
         return NULL;
     }
     session->status = NC_STATUS_STARTING;
-    session->side = NC_CLIENT;
-
-    /* transport lock */
-    session->ti_lock = malloc(sizeof *session->ti_lock);
-    if (!session->ti_lock) {
-        ERRMEM;
-        goto fail;
-    }
-    pthread_mutex_init(session->ti_lock, NULL);
 
     /* fill the session */
     session->ti_type = NC_TI_OPENSSL;
@@ -510,8 +617,9 @@ nc_connect_tls(const char *host, unsigned short port, struct ly_ctx *ctx)
     }
 
     /* create and assign socket */
-    sock = nc_sock_connect(host, port);
+    sock = nc_sock_connect(host, port, -1, NULL);
     if (sock == -1) {
+        ERR("Unable to connect to %s:%u (%s).", host, port, strerror(errno));
         goto fail;
     }
     SSL_set_fd(session->ti.tls, sock);
@@ -520,11 +628,13 @@ nc_connect_tls(const char *host, unsigned short port, struct ly_ctx *ctx)
     SSL_set_mode(session->ti.tls, SSL_MODE_AUTO_RETRY);
 
     /* connect and perform the handshake */
+    nc_gettimespec_mono(&ts_timeout);
+    nc_addtimespec(&ts_timeout, NC_TRANSPORT_TIMEOUT);
     tlsauth_ch = 0;
     while (((ret = SSL_connect(session->ti.tls)) == -1) && (SSL_get_error(session->ti.tls, ret) == SSL_ERROR_WANT_READ)) {
         usleep(NC_TIMEOUT_STEP);
-        elapsed_usec += NC_TIMEOUT_STEP;
-        if (elapsed_usec / 1000 >= NC_TRANSPORT_TIMEOUT) {
+        nc_gettimespec_mono(&ts_cur);
+        if (nc_difftimespec(&ts_cur, &ts_timeout) < 1) {
             ERR("SSL_connect timeout.");
             goto fail;
         }
@@ -554,25 +664,13 @@ nc_connect_tls(const char *host, unsigned short port, struct ly_ctx *ctx)
         WRN("Server certificate verification problem (%s).", X509_verify_cert_error_string(verify));
     }
 
-    /* assign context (dicionary needed for handshake) */
-    if (!ctx) {
-        if (client_opts.schema_searchpath) {
-            ctx = ly_ctx_new(client_opts.schema_searchpath);
-        } else {
-            ctx = ly_ctx_new(SCHEMAS_DIR);
-        }
-        /* definitely should not happen, but be ready */
-        if (!ctx && !(ctx = ly_ctx_new(NULL))) {
-            /* that's just it */
-            goto fail;
-        }
-    } else {
-        session->flags |= NC_SESSION_SHAREDCTX;
+    if (nc_session_new_ctx(session, ctx) != EXIT_SUCCESS) {
+        goto fail;
     }
-    session->ctx = ctx;
+    ctx = session->ctx;
 
     /* NETCONF handshake */
-    if (nc_handshake(session) != NC_MSG_HELLO) {
+    if (nc_handshake_io(session) != NC_MSG_HELLO) {
         goto fail;
     }
     session->status = NC_STATUS_RUNNING;
@@ -607,44 +705,22 @@ nc_connect_libssl(SSL *tls, struct ly_ctx *ctx)
     }
 
     /* prepare session structure */
-    session = calloc(1, sizeof *session);
+    session = nc_new_session(NC_CLIENT, 0);
     if (!session) {
         ERRMEM;
         return NULL;
     }
     session->status = NC_STATUS_STARTING;
-    session->side = NC_CLIENT;
-
-    /* transport lock */
-    session->ti_lock = malloc(sizeof *session->ti_lock);
-    if (!session->ti_lock) {
-        ERRMEM;
-        goto fail;
-    }
-    pthread_mutex_init(session->ti_lock, NULL);
-
     session->ti_type = NC_TI_OPENSSL;
     session->ti.tls = tls;
 
-    /* assign context (dicionary needed for handshake) */
-    if (!ctx) {
-        if (client_opts.schema_searchpath) {
-            ctx = ly_ctx_new(client_opts.schema_searchpath);
-        } else {
-            ctx = ly_ctx_new(SCHEMAS_DIR);
-        }
-        /* definitely should not happen, but be ready */
-        if (!ctx && !(ctx = ly_ctx_new(NULL))) {
-            /* that's just it */
-            goto fail;
-        }
-    } else {
-        session->flags |= NC_SESSION_SHAREDCTX;
+    if (nc_session_new_ctx(session, ctx) != EXIT_SUCCESS) {
+        goto fail;
     }
-    session->ctx = ctx;
+    ctx = session->ctx;
 
     /* NETCONF handshake */
-    if (nc_handshake(session) != NC_MSG_HELLO) {
+    if (nc_handshake_io(session) != NC_MSG_HELLO) {
         goto fail;
     }
     session->status = NC_STATUS_RUNNING;
@@ -663,9 +739,10 @@ fail:
 struct nc_session *
 nc_accept_callhome_tls_sock(int sock, const char *host, uint16_t port, struct ly_ctx *ctx, int timeout)
 {
-    int verify, ret, elapsed_usec = 0;
+    int verify, ret;
     SSL *tls;
     struct nc_session *session;
+    struct timespec ts_timeout, ts_cur;
 
     if (nc_client_tls_update_opts(&tls_ch_opts)) {
         close(sock);
@@ -684,14 +761,20 @@ nc_accept_callhome_tls_sock(int sock, const char *host, uint16_t port, struct ly
     SSL_set_mode(tls, SSL_MODE_AUTO_RETRY);
 
     /* connect and perform the handshake */
+    if (timeout > -1) {
+        nc_gettimespec_mono(&ts_timeout);
+        nc_addtimespec(&ts_timeout, timeout);
+    }
     tlsauth_ch = 1;
     while (((ret = SSL_connect(tls)) == -1) && (SSL_get_error(tls, ret) == SSL_ERROR_WANT_READ)) {
         usleep(NC_TIMEOUT_STEP);
-        elapsed_usec += NC_TIMEOUT_STEP;
-        if ((timeout > -1) && (elapsed_usec / 1000 >= timeout)) {
-            ERR("SSL_connect timeout.");
-            SSL_free(tls);
-            return NULL;
+        if (timeout > -1) {
+            nc_gettimespec_mono(&ts_cur);
+            if (nc_difftimespec(&ts_cur, &ts_timeout) < 1) {
+                ERR("SSL_connect timeout.");
+                SSL_free(tls);
+                return NULL;
+            }
         }
     }
     if (ret != 1) {

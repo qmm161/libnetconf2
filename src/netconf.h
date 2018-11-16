@@ -21,28 +21,44 @@
 extern "C" {
 #endif
 
+/**
+ * @addtogroup misc
+ * @{
+ */
+
+/** @brief Base NETCONF namespace */
 #define NC_NS_BASE  "urn:ietf:params:xml:ns:netconf:base:1.0"
+/** @brief Notifications namespace */
 #define NC_NS_NOTIF "urn:ietf:params:xml:ns:netconf:notification:1.0"
 
 /** @brief Default NETCONF over SSH port */
 #define NC_PORT_SSH 830
 /** @brief Default NETCONF over SSH Call Home port */
-#define NC_PORT_CH_SSH 6666
+#define NC_PORT_CH_SSH 4334
 
 /** @brief Default NETCONF over TLS port */
 #define NC_PORT_TLS 6513
 /** @brief Default NETCONF over TLS Call Home port */
-#define NC_PORT_CH_TLS 6667
+#define NC_PORT_CH_TLS 4335
 
 /** @brief Microseconds after which tasks are repeated until the full timeout elapses.
- *         A second (1000 000) should be divisible by this number without remain.
+ *         A millisecond (1000) should be divisible by this number without remain.
  */
-#define NC_TIMEOUT_STEP 20
+#define NC_TIMEOUT_STEP 50
+
+/**
+ * @brief Set RPC callback to a schema node.
+ *
+ * @param[in] node const struct lys_node *node
+ * @param[in] cb nc_rpc_clb cb
+ */
+#define nc_set_rpc_callback(node, cb) lys_set_private(node, cb)
 
 /**
  * @brief Enumeration of reasons of the NETCONF session termination as defined in RFC 6470.
  */
 typedef enum NC_SESSION_TERM_REASON {
+    NC_SESSION_TERM_ERR = -1,     /**< error return code for function getting the session termination reason */
     NC_SESSION_TERM_NONE = 0,     /**< session still running */
     NC_SESSION_TERM_CLOSED,       /**< closed by client in a normal fashion */
     NC_SESSION_TERM_KILLED,       /**< session was terminated by \<kill-session\> operation */
@@ -84,10 +100,10 @@ typedef enum NC_DATASTORE_TYPE {
  */
 typedef enum NC_WITHDEFAULTS_MODE {
     NC_WD_UNKNOWN = 0,    /**< invalid mode */
-    NC_WD_ALL = 0x01,     /**< report-all mode */
-    NC_WD_ALL_TAG = 0x02, /**< report-all-tagged mode */
-    NC_WD_TRIM = 0x04,    /**< trim mode */
-    NC_WD_EXPLICIT = 0x08 /**< explicit mode */
+    NC_WD_ALL,            /**< report-all mode */
+    NC_WD_ALL_TAG,        /**< report-all-tagged mode */
+    NC_WD_TRIM,           /**< trim mode */
+    NC_WD_EXPLICIT        /**< explicit mode */
 } NC_WD_MODE;
 
 /**
@@ -108,20 +124,6 @@ typedef enum NC_PARAMTYPE {
     NC_PARAMTYPE_FREE,        /**< use the parameter directly, free afterwards */
     NC_PARAMTYPE_DUP_AND_FREE /**< make a copy of the argument, free afterwards */
 } NC_PARAMTYPE;
-
-#if defined(NC_ENABLED_SSH) || defined(NC_ENABLED_TLS)
-
-/**
- * @brief Free all the dynamically allocated thread-specific libssl/libcrypto
- *        resources.
- *
- *        This function should be called only if init was called. Call it in every
- *        thread your application creates just before the thread exits. In the last thread
- *        (usually the main one) call only nc_destroy().
- */
-void nc_thread_destroy(void);
-
-#endif /* NC_ENABLED_SSH || NC_ENABLED_TLS */
 
 /**
  * @brief Transform given time_t (seconds since the epoch) into the RFC 3339 format
@@ -148,6 +150,8 @@ char* nc_time2datetime(time_t time, const char* tz, char *buf);
  * @return time_t value of the given string, -1 on error.
  */
 time_t nc_datetime2time(const char* datetime);
+
+/**@} Miscellaneous */
 
 #ifdef __cplusplus
 }

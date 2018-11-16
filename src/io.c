@@ -12,8 +12,7 @@
  *     https://opensource.org/licenses/BSD-3-Clause
  */
 
-#define _GNU_SOURCE /* asprintf, ppoll */
-#define _POSIX_SOUCE /* signals */
+#define _GNU_SOURCE /* asprintf, signals */
 #include <assert.h>
 #include <errno.h>
 #include <poll.h>
@@ -23,6 +22,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
+
+#ifdef NC_ENABLED_TLS
+#   include <openssl/err.h>
+#endif
 
 #include <libyang/libyang.h>
 
@@ -31,11 +35,11 @@
 #define BUFFERSIZE 512
 
 static ssize_t
-nc_read(struct nc_session *session, char *buf, size_t count, uint16_t *read_timeout)
+nc_read(struct nc_session *session, char *buf, size_t count, uint32_t inact_timeout, struct timespec *ts_act_timeout)
 {
-    size_t size = 0;
+    size_t readd = 0;
     ssize_t r = -1;
-    uint16_t sleep_count = 0;
+    struct timespec ts_cur, ts_inact_timeout;
 
     assert(session);
     assert(buf);
@@ -48,21 +52,20 @@ nc_read(struct nc_session *session, char *buf, size_t count, uint16_t *read_time
         return 0;
     }
 
-    while (count) {
+    nc_gettimespec_mono(&ts_inact_timeout);
+    nc_addtimespec(&ts_inact_timeout, inact_timeout);
+    do {
         switch (session->ti_type) {
         case NC_TI_NONE:
             return 0;
 
         case NC_TI_FD:
             /* read via standard file descriptor */
-            r = read(session->ti.fd.in, &(buf[size]), count);
+            r = read(session->ti.fd.in, buf + readd, count - readd);
             if (r < 0) {
-                if (errno == EAGAIN) {
+                if ((errno == EAGAIN) || (errno == EINTR)) {
                     r = 0;
                     break;
-                } else if (errno == EINTR) {
-                    usleep(NC_TIMEOUT_STEP);
-                    continue;
                 } else {
                     ERR("Session %u: reading from file descriptor (%d) failed (%s).",
                         session->id, session->ti.fd.in, strerror(errno));
@@ -82,7 +85,7 @@ nc_read(struct nc_session *session, char *buf, size_t count, uint16_t *read_time
 #ifdef NC_ENABLED_SSH
         case NC_TI_LIBSSH:
             /* read via libssh */
-            r = ssh_channel_read(session->ti.libssh.channel, &(buf[size]), count, 0);
+            r = ssh_channel_read(session->ti.libssh.channel, buf + readd, count - readd, 0);
             if (r == SSH_AGAIN) {
                 r = 0;
                 break;
@@ -107,7 +110,7 @@ nc_read(struct nc_session *session, char *buf, size_t count, uint16_t *read_time
 #ifdef NC_ENABLED_TLS
         case NC_TI_OPENSSL:
             /* read via OpenSSL */
-            r = SSL_read(session->ti.tls, &(buf[size]), count);
+            r = SSL_read(session->ti.tls, buf + readd, count - readd);
             if (r <= 0) {
                 int x;
                 switch (x = SSL_get_error(session->ti.tls, r)) {
@@ -130,33 +133,37 @@ nc_read(struct nc_session *session, char *buf, size_t count, uint16_t *read_time
 #endif
         }
 
-        /* nothing read */
         if (r == 0) {
+            /* nothing read */
             usleep(NC_TIMEOUT_STEP);
-            ++sleep_count;
-            if (1000000 / NC_TIMEOUT_STEP == sleep_count) {
-                /* we slept a full second */
-                --(*read_timeout);
-                sleep_count = 0;
-            }
-            if (!*read_timeout) {
-                ERR("Session %u: reading a full NETCONF message timeout elapsed.", session->id);
+            nc_gettimespec_mono(&ts_cur);
+            if ((nc_difftimespec(&ts_cur, &ts_inact_timeout) < 1) || (nc_difftimespec(&ts_cur, ts_act_timeout) < 1)) {
+                if (nc_difftimespec(&ts_cur, &ts_inact_timeout) < 1) {
+                    ERR("Session %u: inactive read timeout elapsed.", session->id);
+                } else {
+                    ERR("Session %u: active read timeout elapsed.", session->id);
+                }
                 session->status = NC_STATUS_INVALID;
                 session->term_reason = NC_SESSION_TERM_OTHER;
                 return -1;
             }
-            continue;
+        } else {
+            /* something read */
+            readd += r;
+
+            /* reset inactive timeout */
+            nc_gettimespec_mono(&ts_inact_timeout);
+            nc_addtimespec(&ts_inact_timeout, inact_timeout);
         }
 
-        size += r;
-        count -= r;
-    }
+    } while (readd < count);
+    buf[count] = '\0';
 
-    return (ssize_t)size;
+    return (ssize_t)readd;
 }
 
 static ssize_t
-nc_read_chunk(struct nc_session *session, size_t len, uint16_t *read_timeout, char **chunk)
+nc_read_chunk(struct nc_session *session, size_t len, uint32_t inact_timeout, struct timespec *ts_act_timeout, char **chunk)
 {
     ssize_t r;
 
@@ -173,7 +180,7 @@ nc_read_chunk(struct nc_session *session, size_t len, uint16_t *read_timeout, ch
         return -1;
     }
 
-    r = nc_read(session, *chunk, len, read_timeout);
+    r = nc_read(session, *chunk, len, inact_timeout, ts_act_timeout);
     if (r <= 0) {
         free(*chunk);
         return -1;
@@ -186,10 +193,11 @@ nc_read_chunk(struct nc_session *session, size_t len, uint16_t *read_timeout, ch
 }
 
 static ssize_t
-nc_read_until(struct nc_session *session, const char *endtag, size_t limit, uint16_t *read_timeout, char **result)
+nc_read_until(struct nc_session *session, const char *endtag, size_t limit, uint32_t inact_timeout,
+              struct timespec *ts_act_timeout, char **result)
 {
     char *chunk = NULL;
-    size_t size, count = 0, r, len;
+    size_t size, count = 0, r, len, i, matched = 0;
 
     assert(session);
     assert(endtag);
@@ -215,10 +223,10 @@ nc_read_until(struct nc_session *session, const char *endtag, size_t limit, uint
         }
 
         /* resize buffer if needed */
-        if (count == size) {
+        if ((count + (len - matched)) >= size) {
             /* get more memory */
             size = size + BUFFERSIZE;
-            chunk = realloc(chunk, (size + 1) * sizeof *chunk);
+            chunk = nc_realloc(chunk, (size + 1) * sizeof *chunk);
             if (!chunk) {
                 ERRMEM;
                 return -1;
@@ -226,20 +234,27 @@ nc_read_until(struct nc_session *session, const char *endtag, size_t limit, uint
         }
 
         /* get another character */
-        r = nc_read(session, &(chunk[count]), 1, read_timeout);
-        if (r != 1) {
+        r = nc_read(session, &(chunk[count]), len - matched, inact_timeout, ts_act_timeout);
+        if (r != len - matched) {
             free(chunk);
             return -1;
         }
 
-        count++;
+        count += len - matched;
 
-        /* check endtag */
-        if (count >= len) {
-            if (!strncmp(endtag, &(chunk[count - len]), len)) {
-                /* endtag found */
+        for (i = len - matched; i > 0; i--) {
+            if (!strncmp(&endtag[matched], &(chunk[count - i]), i)) {
+                /*part of endtag found */
+                matched += i;
                 break;
+            } else {
+                matched = 0;
             }
+        }
+
+        /* whole endtag found */
+        if (matched == len) {
+            break;
         }
     }
 
@@ -254,14 +269,16 @@ nc_read_until(struct nc_session *session, const char *endtag, size_t limit, uint
     return count;
 }
 
-/* return NC_MSG_ERROR can change session status */
+/* return NC_MSG_ERROR can change session status, acquires IO lock as needed */
 NC_MSG_TYPE
-nc_read_msg(struct nc_session *session, struct lyxml_elem **data)
+nc_read_msg_io(struct nc_session *session, int io_timeout, struct lyxml_elem **data, int passing_io_lock)
 {
-    int ret;
+    int ret, io_locked = passing_io_lock;
     char *msg = NULL, *chunk;
     uint64_t chunk_len, len = 0;
-    uint16_t read_timeout = NC_READ_TIMEOUT;
+    /* use timeout in milliseconds instead seconds */
+    uint32_t inact_timeout = NC_READ_INACT_TIMEOUT * 1000;
+    struct timespec ts_act_timeout;
     struct nc_server_reply *reply;
 
     assert(session && data);
@@ -269,15 +286,33 @@ nc_read_msg(struct nc_session *session, struct lyxml_elem **data)
 
     if ((session->status != NC_STATUS_RUNNING) && (session->status != NC_STATUS_STARTING)) {
         ERR("Session %u: invalid session to read from.", session->id);
-        return NC_MSG_ERROR;
+        ret = NC_MSG_ERROR;
+        goto cleanup;
+    }
+
+    nc_gettimespec_mono(&ts_act_timeout);
+    nc_addtimespec(&ts_act_timeout, NC_READ_ACT_TIMEOUT * 1000);
+
+    if (!io_locked) {
+        /* SESSION IO LOCK */
+        ret = nc_session_io_lock(session, io_timeout, __func__);
+        if (ret < 0) {
+            ret = NC_MSG_ERROR;
+            goto cleanup;
+        } else if (!ret) {
+            ret = NC_MSG_WOULDBLOCK;
+            goto cleanup;
+        }
+        io_locked = 1;
     }
 
     /* read the message */
     switch (session->version) {
     case NC_VERSION_10:
-        ret = nc_read_until(session, NC_VERSION_10_ENDTAG, 0, &read_timeout, &msg);
+        ret = nc_read_until(session, NC_VERSION_10_ENDTAG, 0, inact_timeout, &ts_act_timeout, &msg);
         if (ret == -1) {
-            goto error;
+            ret = NC_MSG_ERROR;
+            goto cleanup;
         }
 
         /* cut off the end tag */
@@ -285,18 +320,24 @@ nc_read_msg(struct nc_session *session, struct lyxml_elem **data)
         break;
     case NC_VERSION_11:
         while (1) {
-            ret = nc_read_until(session, "\n#", 0, &read_timeout, NULL);
+            ret = nc_read_until(session, "\n#", 0, inact_timeout, &ts_act_timeout, NULL);
             if (ret == -1) {
-                goto error;
+                ret = NC_MSG_ERROR;
+                goto cleanup;
             }
-            ret = nc_read_until(session, "\n", 0, &read_timeout, &chunk);
+            ret = nc_read_until(session, "\n", 0, inact_timeout, &ts_act_timeout, &chunk);
             if (ret == -1) {
-                goto error;
+                ret = NC_MSG_ERROR;
+                goto cleanup;
             }
 
             if (!strcmp(chunk, "#\n")) {
                 /* end of chunked framing message */
                 free(chunk);
+                if (!msg) {
+                    ERR("Session %u: invalid frame chunk delimiters.", session->id);
+                    goto malformed_msg;
+                }
                 break;
             }
 
@@ -309,16 +350,18 @@ nc_read_msg(struct nc_session *session, struct lyxml_elem **data)
             }
 
             /* now we have size of next chunk, so read the chunk */
-            ret = nc_read_chunk(session, chunk_len, &read_timeout, &chunk);
+            ret = nc_read_chunk(session, chunk_len, inact_timeout, &ts_act_timeout, &chunk);
             if (ret == -1) {
-                goto error;
+                ret = NC_MSG_ERROR;
+                goto cleanup;
             }
 
             /* realloc message buffer, remember to count terminating null byte */
-            msg = realloc(msg, len + chunk_len + 1);
+            msg = nc_realloc(msg, len + chunk_len + 1);
             if (!msg) {
                 ERRMEM;
-                goto error;
+                ret = NC_MSG_ERROR;
+                goto cleanup;
             }
             memcpy(msg + len, chunk, chunk_len);
             len += chunk_len;
@@ -328,7 +371,13 @@ nc_read_msg(struct nc_session *session, struct lyxml_elem **data)
 
         break;
     }
-    DBG("Session %u: received message:\n%s", session->id, msg);
+
+    /* SESSION IO UNLOCK */
+    assert(io_locked);
+    nc_session_io_unlock(session, __func__);
+    io_locked = 0;
+
+    DBG("Session %u: received message:\n%s\n", session->id, msg);
 
     /* build XML tree */
     *data = lyxml_parse_mem(session->ctx, msg, 0);
@@ -371,7 +420,13 @@ malformed_msg:
         /* NETCONF version 1.1 defines sending error reply from the server (RFC 6241 sec. 3) */
         reply = nc_server_reply_err(nc_err(NC_ERR_MALFORMED_MSG));
 
-        if (nc_write_msg(session, NC_MSG_REPLY, NULL, reply) == -1) {
+        if (io_locked) {
+            /* nc_write_msg_io locks and unlocks the lock by itself */
+            nc_session_io_unlock(session, __func__);
+            io_locked = 0;
+        }
+
+        if (nc_write_msg_io(session, io_timeout, NC_MSG_REPLY, NULL, reply) != NC_MSG_REPLY) {
             ERR("Session %u: unable to send a \"Malformed message\" error reply, terminating session.", session->id);
             if (session->status != NC_STATUS_INVALID) {
                 session->status = NC_STATUS_INVALID;
@@ -380,24 +435,26 @@ malformed_msg:
         }
         nc_server_reply_free(reply);
     }
+    ret = NC_MSG_ERROR;
 
-error:
-    /* cleanup */
+cleanup:
+    if (io_locked) {
+        nc_session_io_unlock(session, __func__);
+    }
     free(msg);
     free(*data);
     *data = NULL;
 
-    return NC_MSG_ERROR;
+    return ret;
 }
 
 /* return -1 means either poll error or that session was invalidated (socket error), EINTR is handled inside */
 static int
-nc_read_poll(struct nc_session *session, int timeout)
+nc_read_poll(struct nc_session *session, int io_timeout)
 {
-    sigset_t sigmask;
+    sigset_t sigmask, origmask;
     int ret = -2;
     struct pollfd fds;
-    struct timespec ts_timeout;
 
     if ((session->status != NC_STATUS_RUNNING) && (session->status != NC_STATUS_STARTING)) {
         ERR("Session %u: invalid session to poll.", session->id);
@@ -408,9 +465,9 @@ nc_read_poll(struct nc_session *session, int timeout)
 #ifdef NC_ENABLED_SSH
     case NC_TI_LIBSSH:
         /* EINTR is handled, it resumes waiting */
-        ret = ssh_channel_poll_timeout(session->ti.libssh.channel, timeout, 0);
+        ret = ssh_channel_poll_timeout(session->ti.libssh.channel, io_timeout, 0);
         if (ret == SSH_ERROR) {
-            ERR("Session %u: polling on the SSH channel failed (%s).", session->id,
+            ERR("Session %u: SSH channel poll error (%s).", session->id,
                 ssh_get_error(session->ti.libssh.session));
             session->status = NC_STATUS_INVALID;
             session->term_reason = NC_SESSION_TERM_OTHER;
@@ -427,37 +484,33 @@ nc_read_poll(struct nc_session *session, int timeout)
         } else { /* ret == 0 */
             fds.revents = 0;
         }
-        /* fallthrough */
+        break;
 #endif
 #ifdef NC_ENABLED_TLS
     case NC_TI_OPENSSL:
-        if (session->ti_type == NC_TI_OPENSSL) {
-            fds.fd = SSL_get_fd(session->ti.tls);
+        ret = SSL_pending(session->ti.tls);
+        if (ret) {
+            /* some buffered TLS data available */
+            ret = 1;
+            fds.revents = POLLIN;
+            break;
         }
-        /* fallthrough */
+
+        fds.fd = SSL_get_fd(session->ti.tls);
 #endif
+        /* fallthrough */
     case NC_TI_FD:
         if (session->ti_type == NC_TI_FD) {
             fds.fd = session->ti.fd.in;
         }
 
-        /* poll only if it is not an SSH session */
-        if (ret == -2) {
-            fds.events = POLLIN;
-            fds.revents = 0;
+        fds.events = POLLIN;
+        fds.revents = 0;
 
-            if (timeout > -1) {
-                if (!timeout) {
-                    ts_timeout.tv_sec = 0;
-                    ts_timeout.tv_nsec = 0;
-                } else if (timeout > 0) {
-                    ts_timeout.tv_sec = timeout / 1000;
-                    ts_timeout.tv_nsec = (timeout % 1000) * 1000000;
-                }
-            }
-            sigfillset(&sigmask);
-            ret = ppoll(&fds, 1, (timeout == -1 ? NULL : &ts_timeout), &sigmask);
-        }
+        sigfillset(&sigmask);
+        pthread_sigmask(SIG_SETMASK, &sigmask, &origmask);
+        ret = poll(&fds, 1, io_timeout);
+        pthread_sigmask(SIG_SETMASK, &origmask, NULL);
 
         break;
 
@@ -469,7 +522,7 @@ nc_read_poll(struct nc_session *session, int timeout)
     /* process the poll result, unified ret meaning for poll and ssh_channel poll */
     if (ret < 0) {
         /* poll failed - something really bad happened, close the session */
-        ERR("Session %u: ppoll error (%s).", session->id, strerror(errno));
+        ERR("Session %u: poll error (%s).", session->id, strerror(errno));
         session->status = NC_STATUS_INVALID;
         session->term_reason = NC_SESSION_TERM_OTHER;
         return -1;
@@ -492,9 +545,9 @@ nc_read_poll(struct nc_session *session, int timeout)
     return ret;
 }
 
-/* return NC_MSG_ERROR can change session status */
+/* return NC_MSG_ERROR can change session status, acquires IO lock as needed */
 NC_MSG_TYPE
-nc_read_msg_poll(struct nc_session *session, int timeout, struct lyxml_elem **data)
+nc_read_msg_poll_io(struct nc_session *session, int io_timeout, struct lyxml_elem **data)
 {
     int ret;
 
@@ -506,16 +559,31 @@ nc_read_msg_poll(struct nc_session *session, int timeout, struct lyxml_elem **da
         return NC_MSG_ERROR;
     }
 
-    ret = nc_read_poll(session, timeout);
+    /* SESSION IO LOCK */
+    ret = nc_session_io_lock(session, io_timeout, __func__);
+    if (ret < 0) {
+        return NC_MSG_ERROR;
+    } else if (!ret) {
+        return NC_MSG_WOULDBLOCK;
+    }
+
+    ret = nc_read_poll(session, io_timeout);
     if (ret == 0) {
         /* timed out */
+
+        /* SESSION IO UNLOCK */
+        nc_session_io_unlock(session, __func__);
         return NC_MSG_WOULDBLOCK;
     } else if (ret < 0) {
         /* poll error, error written */
+
+        /* SESSION IO UNLOCK */
+        nc_session_io_unlock(session, __func__);
         return NC_MSG_ERROR;
     }
 
-    return nc_read_msg(session, data);
+    /* SESSION IO LOCK passed down */
+    return nc_read_msg_io(session, io_timeout, data, 1);
 }
 
 /* does not really log, only fatal errors */
@@ -531,20 +599,23 @@ nc_session_is_connected(struct nc_session *session)
         break;
 #ifdef NC_ENABLED_SSH
     case NC_TI_LIBSSH:
-        fds.fd = ssh_get_fd(session->ti.libssh.session);
-        break;
+        return ssh_is_connected(session->ti.libssh.session);
 #endif
 #ifdef NC_ENABLED_TLS
     case NC_TI_OPENSSL:
         fds.fd = SSL_get_fd(session->ti.tls);
         break;
 #endif
-    case NC_TI_NONE:
-        ERRINT;
+    default:
+        return 0;
+    }
+
+    if (fds.fd == -1) {
         return 0;
     }
 
     fds.events = POLLIN;
+    fds.revents = 0;
 
     errno = 0;
     while (((ret = poll(&fds, 1, 0)) == -1) && (errno == EINTR));
@@ -566,9 +637,15 @@ struct wclb_arg {
     size_t len;
 };
 
-static ssize_t
+static int
 nc_write(struct nc_session *session, const void *buf, size_t count)
 {
+    int c;
+    size_t written = 0;
+#ifdef NC_ENABLED_TLS
+    unsigned long e;
+#endif
+
     if ((session->status != NC_STATUS_RUNNING) && (session->status != NC_STATUS_STARTING)) {
         return -1;
     }
@@ -581,34 +658,75 @@ nc_write(struct nc_session *session, const void *buf, size_t count)
         return -1;
     }
 
-    switch (session->ti_type) {
-    case NC_TI_NONE:
-        return -1;
+    DBG("Session %u: sending message:\n%.*s\n", session->id, count, buf);
 
-    case NC_TI_FD:
-        return write(session->ti.fd.out, buf, count);
+    do {
+        switch (session->ti_type) {
+        case NC_TI_FD:
+            c = write(session->ti.fd.out, (char *)(buf + written), count - written);
+            if (c < 0) {
+                ERR("Session %u: socket error (%s).", session->id, strerror(errno));
+                return -1;
+            }
+            break;
 
 #ifdef NC_ENABLED_SSH
-    case NC_TI_LIBSSH:
-        if (ssh_channel_is_closed(session->ti.libssh.channel) || ssh_channel_is_eof(session->ti.libssh.channel)) {
-            if (ssh_channel_is_closed(session->ti.libssh.channel)) {
-                ERR("Session %u: SSH channel unexpectedly closed.", session->id);
-            } else {
-                ERR("Session %u: SSH channel unexpected EOF.", session->id);
+        case NC_TI_LIBSSH:
+            if (ssh_channel_is_closed(session->ti.libssh.channel) || ssh_channel_is_eof(session->ti.libssh.channel)) {
+                if (ssh_channel_is_closed(session->ti.libssh.channel)) {
+                    ERR("Session %u: SSH channel unexpectedly closed.", session->id);
+                } else {
+                    ERR("Session %u: SSH channel unexpected EOF.", session->id);
+                }
+                session->status = NC_STATUS_INVALID;
+                session->term_reason = NC_SESSION_TERM_DROPPED;
+                return -1;
             }
-            session->status = NC_STATUS_INVALID;
-            session->term_reason = NC_SESSION_TERM_DROPPED;
-            return -1;
-        }
-        return ssh_channel_write(session->ti.libssh.channel, buf, count);
+            c = ssh_channel_write(session->ti.libssh.channel, (char *)(buf + written), count - written);
+            if ((c == SSH_ERROR) || (c == -1)) {
+                ERR("Session %u: SSH channel write failed.", session->id);
+                return -1;
+            }
+            break;
 #endif
 #ifdef NC_ENABLED_TLS
-    case NC_TI_OPENSSL:
-        return SSL_write(session->ti.tls, buf, count);
+        case NC_TI_OPENSSL:
+            c = SSL_write(session->ti.tls, (char *)(buf + written), count - written);
+            if (c < 1) {
+                switch ((e = SSL_get_error(session->ti.tls, c))) {
+                case SSL_ERROR_ZERO_RETURN:
+                    ERR("Session %u: SSL connection was properly closed.", session->id);
+                    return -1;
+                case SSL_ERROR_WANT_WRITE:
+                    c = 0;
+                    break;
+                case SSL_ERROR_SYSCALL:
+                    ERR("Session %u: SSL socket error (%s).", session->id, strerror(errno));
+                    return -1;
+                case SSL_ERROR_SSL:
+                    ERR("Session %u: SSL error (%s).", session->id, ERR_reason_error_string(e));
+                    return -1;
+                default:
+                    ERR("Session %u: unknown SSL error occured.", session->id);
+                    return -1;
+                }
+            }
+            break;
 #endif
-    }
+        default:
+            ERRINT;
+            return -1;
+        }
 
-    return -1;
+        if (c == 0) {
+            /* we must wait */
+            usleep(NC_TIMEOUT_STEP);
+        }
+
+        written += c;
+    } while (written < count);
+
+    return written;
 }
 
 static int
@@ -754,14 +872,39 @@ nc_write_xmlclb(void *arg, const void *buf, size_t count)
 }
 
 static void
-nc_write_error(struct wclb_arg *arg, struct nc_server_error *err)
+nc_write_error_elem(struct wclb_arg *arg, const char *name, uint16_t nam_len, const char *prefix, uint16_t pref_len,
+                    int open, int no_attr)
 {
-    uint16_t i;
+    if (open) {
+        nc_write_clb((void *)arg, "<", 1, 0);
+    } else {
+        nc_write_clb((void *)arg, "</", 2, 0);
+    }
+
+    if (prefix) {
+        nc_write_clb((void *)arg, prefix, pref_len, 0);
+        nc_write_clb((void *)arg, ":", 1, 0);
+    }
+
+    nc_write_clb((void *)arg, name, nam_len, 0);
+    if (!open || !no_attr) {
+        nc_write_clb((void *)arg, ">", 1, 0);
+    }
+}
+
+static void
+nc_write_error(struct wclb_arg *arg, struct nc_server_error *err, const char *prefix)
+{
+    uint16_t i, pref_len = 0;
     char str_sid[11];
 
-    nc_write_clb((void *)arg, "<rpc-error>", 11, 0);
+    if (prefix) {
+        pref_len = strlen(prefix);
+    }
 
-    nc_write_clb((void *)arg, "<error-type>", 12, 0);
+    nc_write_error_elem(arg, "rpc-error", 9, prefix, pref_len, 1, 0);
+
+    nc_write_error_elem(arg, "error-type", 10, prefix, pref_len, 1, 0);
     switch (err->type) {
     case NC_ERR_TYPE_TRAN:
         nc_write_clb((void *)arg, "transport", 9, 0);
@@ -779,9 +922,10 @@ nc_write_error(struct wclb_arg *arg, struct nc_server_error *err)
         ERRINT;
         return;
     }
-    nc_write_clb((void *)arg, "</error-type>", 13, 0);
 
-    nc_write_clb((void *)arg, "<error-tag>", 11, 0);
+    nc_write_error_elem(arg, "error-type", 10, prefix, pref_len, 0, 0);
+
+    nc_write_error_elem(arg, "error-tag", 9, prefix, pref_len, 1, 0);
     switch (err->tag) {
     case NC_ERR_IN_USE:
         nc_write_clb((void *)arg, "in-use", 6, 0);
@@ -844,24 +988,26 @@ nc_write_error(struct wclb_arg *arg, struct nc_server_error *err)
         ERRINT;
         return;
     }
-    nc_write_clb((void *)arg, "</error-tag>", 12, 0);
+    nc_write_error_elem(arg, "error-tag", 9, prefix, pref_len, 0, 0);
 
-    nc_write_clb((void *)arg, "<error-severity>error</error-severity>", 38, 0);
+    nc_write_error_elem(arg, "error-severity", 14, prefix, pref_len, 1, 0);
+    nc_write_clb((void *)arg, "error", 5, 0);
+    nc_write_error_elem(arg, "error-severity", 14, prefix, pref_len, 0, 0);
 
     if (err->apptag) {
-        nc_write_clb((void *)arg, "<error-app-tag>", 15, 0);
+        nc_write_error_elem(arg, "error-app-tag", 13, prefix, pref_len, 1, 0);
         nc_write_clb((void *)arg, err->apptag, strlen(err->apptag), 1);
-        nc_write_clb((void *)arg, "</error-app-tag>", 16, 0);
+        nc_write_error_elem(arg, "error-app-tag", 13, prefix, pref_len, 0, 0);
     }
 
     if (err->path) {
-        nc_write_clb((void *)arg, "<error-path>", 12, 0);
+        nc_write_error_elem(arg, "error-path", 10, prefix, pref_len, 1, 0);
         nc_write_clb((void *)arg, err->path, strlen(err->path), 1);
-        nc_write_clb((void *)arg, "</error-path>", 13, 0);
+        nc_write_error_elem(arg, "error-path", 10, prefix, pref_len, 0, 0);
     }
 
     if (err->message) {
-        nc_write_clb((void *)arg, "<error-message", 14, 0);
+        nc_write_error_elem(arg, "error-message", 13, prefix, pref_len, 1, 1);
         if (err->message_lang) {
             nc_write_clb((void *)arg, " xml:lang=\"", 11, 0);
             nc_write_clb((void *)arg, err->message_lang, strlen(err->message_lang), 1);
@@ -869,74 +1015,84 @@ nc_write_error(struct wclb_arg *arg, struct nc_server_error *err)
         }
         nc_write_clb((void *)arg, ">", 1, 0);
         nc_write_clb((void *)arg, err->message, strlen(err->message), 1);
-        nc_write_clb((void *)arg, "</error-message>", 16, 0);
+        nc_write_error_elem(arg, "error-message", 13, prefix, pref_len, 0, 0);
     }
 
     if ((err->sid > -1) || err->attr_count || err->elem_count || err->ns_count || err->other_count) {
-        nc_write_clb((void *)arg, "<error-info>", 12, 0);
+        nc_write_error_elem(arg, "error-info", 10, prefix, pref_len, 1, 0);
 
         if (err->sid > -1) {
-            nc_write_clb((void *)arg, "<session-id>", 12, 0);
+            nc_write_error_elem(arg, "session-id", 10, prefix, pref_len, 1, 0);
             sprintf(str_sid, "%u", (uint32_t)err->sid);
             nc_write_clb((void *)arg, str_sid, strlen(str_sid), 0);
-            nc_write_clb((void *)arg, "</session-id>", 13, 0);
+            nc_write_error_elem(arg, "session-id", 10, prefix, pref_len, 0, 0);
         }
 
         for (i = 0; i < err->attr_count; ++i) {
-            nc_write_clb((void *)arg, "<bad-attribute>", 15, 0);
+            nc_write_error_elem(arg, "bad-attribute", 13, prefix, pref_len, 1, 0);
             nc_write_clb((void *)arg, err->attr[i], strlen(err->attr[i]), 1);
-            nc_write_clb((void *)arg, "</bad-attribute>", 16, 0);
+            nc_write_error_elem(arg, "bad-attribute", 13, prefix, pref_len, 0, 0);
         }
 
         for (i = 0; i < err->elem_count; ++i) {
-            nc_write_clb((void *)arg, "<bad-element>", 13, 0);
+            nc_write_error_elem(arg, "bad-element", 11, prefix, pref_len, 1, 0);
             nc_write_clb((void *)arg, err->elem[i], strlen(err->elem[i]), 1);
-            nc_write_clb((void *)arg, "</bad-element>", 14, 0);
+            nc_write_error_elem(arg, "bad-element", 11, prefix, pref_len, 0, 0);
         }
 
         for (i = 0; i < err->ns_count; ++i) {
-            nc_write_clb((void *)arg, "<bad-namespace>", 15, 0);
+            nc_write_error_elem(arg, "bad-namespace", 13, prefix, pref_len, 1, 0);
             nc_write_clb((void *)arg, err->ns[i], strlen(err->ns[i]), 1);
-            nc_write_clb((void *)arg, "</bad-namespace>", 16, 0);
+            nc_write_error_elem(arg, "bad-namespace", 13, prefix, pref_len, 0, 0);
         }
 
         for (i = 0; i < err->other_count; ++i) {
             lyxml_print_clb(nc_write_xmlclb, (void *)arg, err->other[i], 0);
         }
 
-        nc_write_clb((void *)arg, "</error-info>", 13, 0);
+        nc_write_error_elem(arg, "error-info", 10, prefix, pref_len, 0, 0);
     }
 
-    nc_write_clb((void *)arg, "</rpc-error>", 12, 0);
+    nc_write_error_elem(arg, "rpc-error", 9, prefix, pref_len, 0, 0);
 }
 
-/* return -1 can change session status */
-int
-nc_write_msg(struct nc_session *session, NC_MSG_TYPE type, ...)
+/* return NC_MSG_ERROR can change session status, acquires IO lock as needed */
+NC_MSG_TYPE
+nc_write_msg_io(struct nc_session *session, int io_timeout, int type, ...)
 {
     va_list ap;
-    int count;
-    const char *attrs;
+    int count, ret;
+    const char *attrs, *base_prefix;
     struct lyd_node *content;
     struct lyxml_elem *rpc_elem;
+    struct nc_server_notif *notif;
     struct nc_server_reply *reply;
     struct nc_server_reply_error *error_rpl;
     char *buf = NULL;
     struct wclb_arg arg;
     const char **capabilities;
     uint32_t *sid = NULL, i;
+    int wd = 0;
 
     assert(session);
 
     if ((session->status != NC_STATUS_RUNNING) && (session->status != NC_STATUS_STARTING)) {
         ERR("Session %u: invalid session to write to.", session->id);
-        return -1;
+        return NC_MSG_ERROR;
     }
-
-    va_start(ap, type);
 
     arg.session = session;
     arg.len = 0;
+
+    /* SESSION IO LOCK */
+    ret = nc_session_io_lock(session, io_timeout, __func__);
+    if (ret < 0) {
+        return NC_MSG_ERROR;
+    } else if (!ret) {
+        return NC_MSG_WOULDBLOCK;
+    }
+
+    va_start(ap, type);
 
     switch (type) {
     case NC_MSG_RPC:
@@ -944,66 +1100,118 @@ nc_write_msg(struct nc_session *session, NC_MSG_TYPE type, ...)
         attrs = va_arg(ap, const char *);
 
         count = asprintf(&buf, "<rpc xmlns=\"%s\" message-id=\"%"PRIu64"\"%s>",
-                         NC_NS_BASE, session->msgid + 1, attrs ? attrs : "");
+                         NC_NS_BASE, session->opts.client.msgid + 1, attrs ? attrs : "");
         if (count == -1) {
             ERRMEM;
-            va_end(ap);
-            return -1;
+            ret = NC_MSG_ERROR;
+            goto cleanup;
         }
         nc_write_clb((void *)&arg, buf, count, 0);
         free(buf);
-        lyd_print_clb(nc_write_xmlclb, (void *)&arg, content, LYD_XML, LYP_WITHSIBLINGS);
+
+        if (lyd_print_clb(nc_write_xmlclb, (void *)&arg, content, LYD_XML, LYP_WITHSIBLINGS | LYP_NETCONF)) {
+            ret = NC_MSG_ERROR;
+            goto cleanup;
+        }
         nc_write_clb((void *)&arg, "</rpc>", 6, 0);
 
-        session->msgid++;
+        session->opts.client.msgid++;
         break;
 
     case NC_MSG_REPLY:
         rpc_elem = va_arg(ap, struct lyxml_elem *);
         reply = va_arg(ap, struct nc_server_reply *);
 
-        nc_write_clb((void *)&arg, "<rpc-reply", 10, 0);
+        if (rpc_elem && rpc_elem->ns && rpc_elem->ns->prefix) {
+            nc_write_clb((void *)&arg, "<", 1, 0);
+            nc_write_clb((void *)&arg, rpc_elem->ns->prefix, strlen(rpc_elem->ns->prefix), 0);
+            nc_write_clb((void *)&arg, ":rpc-reply", 10, 0);
+            base_prefix = rpc_elem->ns->prefix;
+        }
+        else {
+            nc_write_clb((void *)&arg, "<rpc-reply", 10, 0);
+            base_prefix = NULL;
+        }
+
         /* can be NULL if replying with a malformed-message error */
         if (rpc_elem) {
             lyxml_print_clb(nc_write_xmlclb, (void *)&arg, rpc_elem, LYXML_PRINT_ATTRS);
             nc_write_clb((void *)&arg, ">", 1, 0);
         } else {
             /* but put there at least the correct namespace */
-            nc_write_clb((void *)&arg, "xmlns=\""NC_NS_BASE"\">", 48, 0);
+            nc_write_clb((void *)&arg, " xmlns=\""NC_NS_BASE"\">", 49, 0);
         }
         switch (reply->type) {
         case NC_RPL_OK:
-            nc_write_clb((void *)&arg, "<ok/>", 5, 0);
+            nc_write_clb((void *)&arg, "<", 1, 0);
+            if (base_prefix) {
+                nc_write_clb((void *)&arg, base_prefix, strlen(base_prefix), 0);
+                nc_write_clb((void *)&arg, ":", 1, 0);
+            }
+            nc_write_clb((void *)&arg, "ok/>", 4, 0);
             break;
         case NC_RPL_DATA:
-            assert(((struct nc_reply_data *)reply)->data->schema->nodetype == LYS_RPC);
-            lyd_print_clb(nc_write_xmlclb, (void *)&arg, ((struct nc_reply_data *)reply)->data->child, LYD_XML, LYP_WITHSIBLINGS);
+            switch(((struct nc_server_reply_data *)reply)->wd) {
+            case NC_WD_UNKNOWN:
+            case NC_WD_EXPLICIT:
+                wd = LYP_WD_EXPLICIT;
+                break;
+            case NC_WD_TRIM:
+                wd = LYP_WD_TRIM;
+                break;
+            case NC_WD_ALL:
+                wd = LYP_WD_ALL;
+                break;
+            case NC_WD_ALL_TAG:
+                wd = LYP_WD_ALL_TAG;
+                break;
+            }
+            if (lyd_print_clb(nc_write_xmlclb, (void *)&arg, ((struct nc_reply_data *)reply)->data, LYD_XML,
+                              LYP_WITHSIBLINGS | LYP_NETCONF | wd)) {
+                ret = NC_MSG_ERROR;
+                goto cleanup;
+            }
             break;
         case NC_RPL_ERROR:
             error_rpl = (struct nc_server_reply_error *)reply;
             for (i = 0; i < error_rpl->count; ++i) {
-                nc_write_error(&arg, error_rpl->err[i]);
+                nc_write_error(&arg, error_rpl->err[i], base_prefix);
             }
             break;
         default:
             ERRINT;
             nc_write_clb((void *)&arg, NULL, 0, 0);
-            va_end(ap);
-            return -1;
+            ret = NC_MSG_ERROR;
+            goto cleanup;
         }
-        nc_write_clb((void *)&arg, "</rpc-reply>", 12, 0);
+        if (rpc_elem && rpc_elem->ns && rpc_elem->ns->prefix) {
+            nc_write_clb((void *)&arg, "</", 2, 0);
+            nc_write_clb((void *)&arg, rpc_elem->ns->prefix, strlen(rpc_elem->ns->prefix), 0);
+            nc_write_clb((void *)&arg, ":rpc-reply>", 11, 0);
+        }
+        else {
+            nc_write_clb((void *)&arg, "</rpc-reply>", 12, 0);
+        }
         break;
 
     case NC_MSG_NOTIF:
-        nc_write_clb((void *)&arg, "<notification xmlns=\""NC_NS_NOTIF"\"/>", 21 + 47 + 3, 0);
-        /* TODO content */
-        nc_write_clb((void *)&arg, "</notification>", 12, 0);
+        notif = va_arg(ap, struct nc_server_notif *);
+
+        nc_write_clb((void *)&arg, "<notification xmlns=\""NC_NS_NOTIF"\">", 21 + 47 + 2, 0);
+        nc_write_clb((void *)&arg, "<eventTime>", 11, 0);
+        nc_write_clb((void *)&arg, notif->eventtime, strlen(notif->eventtime), 0);
+        nc_write_clb((void *)&arg, "</eventTime>", 12, 0);
+        if (lyd_print_clb(nc_write_xmlclb, (void *)&arg, notif->tree, LYD_XML, 0)) {
+            ret = NC_MSG_ERROR;
+            goto cleanup;
+        }
+        nc_write_clb((void *)&arg, "</notification>", 15, 0);
         break;
 
     case NC_MSG_HELLO:
         if (session->version != NC_VERSION_10) {
-            va_end(ap);
-            return -1;
+            ret = NC_MSG_ERROR;
+            goto cleanup;
         }
         capabilities = va_arg(ap, const char **);
         sid = va_arg(ap, uint32_t*);
@@ -1011,8 +1219,8 @@ nc_write_msg(struct nc_session *session, NC_MSG_TYPE type, ...)
         count = asprintf(&buf, "<hello xmlns=\"%s\"><capabilities>", NC_NS_BASE);
         if (count == -1) {
             ERRMEM;
-            va_end(ap);
-            return -1;
+            ret = NC_MSG_ERROR;
+            goto cleanup;
         }
         nc_write_clb((void *)&arg, buf, count, 0);
         free(buf);
@@ -1025,8 +1233,8 @@ nc_write_msg(struct nc_session *session, NC_MSG_TYPE type, ...)
             count = asprintf(&buf, "</capabilities><session-id>%u</session-id></hello>", *sid);
             if (count == -1) {
                 ERRMEM;
-                va_end(ap);
-                return -1;
+                ret = NC_MSG_ERROR;
+                goto cleanup;
             }
             nc_write_clb((void *)&arg, buf, count, 0);
             free(buf);
@@ -1036,20 +1244,25 @@ nc_write_msg(struct nc_session *session, NC_MSG_TYPE type, ...)
         break;
 
     default:
-        va_end(ap);
-        return -1;
+        ret = NC_MSG_ERROR;
+        goto cleanup;
     }
 
     /* flush message */
     nc_write_clb((void *)&arg, NULL, 0, 0);
 
-    va_end(ap);
     if ((session->status != NC_STATUS_RUNNING) && (session->status != NC_STATUS_STARTING)) {
         /* error was already written */
-        return -1;
+        ret = NC_MSG_ERROR;
+    } else {
+        /* specific message successfully sent */
+        ret = type;
     }
 
-    return 0;
+cleanup:
+    va_end(ap);
+    nc_session_io_unlock(session, __func__);
+    return ret;
 }
 
 void *
@@ -1064,3 +1277,4 @@ nc_realloc(void *ptr, size_t size)
 
     return ret;
 }
+

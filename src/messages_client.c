@@ -12,6 +12,7 @@
  *     https://opensource.org/licenses/BSD-3-Clause
  */
 
+#include <assert.h>
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,11 +38,11 @@ nc_rpc_get_type(const struct nc_rpc *rpc)
 }
 
 API struct nc_rpc *
-nc_rpc_generic(const struct lyd_node *data, NC_PARAMTYPE paramtype)
+nc_rpc_act_generic(const struct lyd_node *data, NC_PARAMTYPE paramtype)
 {
-    struct nc_rpc_generic *rpc;
+    struct nc_rpc_act_generic *rpc;
 
-    if (!data || (data->schema->nodetype != LYS_RPC) || data->next || (data->prev != data)) {
+    if (!data || data->next || (data->prev != data)) {
         ERRARG("data");
         return NULL;
     }
@@ -52,7 +53,7 @@ nc_rpc_generic(const struct lyd_node *data, NC_PARAMTYPE paramtype)
         return NULL;
     }
 
-    rpc->type = NC_RPC_GENERIC;
+    rpc->type = NC_RPC_ACT_GENERIC;
     rpc->has_data = 1;
     if (paramtype == NC_PARAMTYPE_DUP_AND_FREE) {
         rpc->content.data = lyd_dup(data, 1);
@@ -65,9 +66,9 @@ nc_rpc_generic(const struct lyd_node *data, NC_PARAMTYPE paramtype)
 }
 
 API struct nc_rpc *
-nc_rpc_generic_xml(const char *xml_str, NC_PARAMTYPE paramtype)
+nc_rpc_act_generic_xml(const char *xml_str, NC_PARAMTYPE paramtype)
 {
-    struct nc_rpc_generic *rpc;
+    struct nc_rpc_act_generic *rpc;
 
     if (!xml_str) {
         ERRARG("xml_str");
@@ -80,7 +81,7 @@ nc_rpc_generic_xml(const char *xml_str, NC_PARAMTYPE paramtype)
         return NULL;
     }
 
-    rpc->type = NC_RPC_GENERIC;
+    rpc->type = NC_RPC_ACT_GENERIC;
     rpc->has_data = 0;
     if (paramtype == NC_PARAMTYPE_DUP_AND_FREE) {
         rpc->content.xml_str = strdup(xml_str);
@@ -103,7 +104,7 @@ nc_rpc_getconfig(NC_DATASTORE source, const char *filter, NC_WD_MODE wd_mode, NC
     }
 
     if (filter && filter[0] && (filter[0] != '<') && (filter[0] != '/') && !isalpha(filter[0])) {
-        ERR("Filter must either be an XML subtree or an XPath expression (invalid first char '%c').", filter[0]);
+        ERR("Filter is neither an XML subtree nor an XPath expression (invalid first char '%c').", filter[0]);
         return NULL;
     }
 
@@ -140,8 +141,8 @@ nc_rpc_edit(NC_DATASTORE target, NC_RPC_EDIT_DFLTOP default_op, NC_RPC_EDIT_TEST
         return NULL;
     }
 
-    if ((edit_content[0] != '<') && !isalpha(edit_content[0])) {
-        ERR("<edit-config> content must either be a URL or an XML config (invalid first char '%c').", edit_content[0]);
+    if (edit_content[0] && (edit_content[0] != '<') && !isalpha(edit_content[0])) {
+        ERR("<edit-config> content is neither a URL nor an XML config (invalid first char '%c').", edit_content[0]);
         return NULL;
     }
 
@@ -180,7 +181,7 @@ nc_rpc_copy(NC_DATASTORE target, const char *url_trg, NC_DATASTORE source, const
         return NULL;
     }
 
-    if (url_or_config_src && (url_or_config_src[0] != '<') && !isalpha(url_or_config_src[0])) {
+    if (url_or_config_src && url_or_config_src[0] && (url_or_config_src[0] != '<') && !isalpha(url_or_config_src[0])) {
         ERR("<copy-config> source is neither a URL nor an XML config (invalid first char '%c').", url_or_config_src[0]);
         return NULL;
     }
@@ -288,7 +289,7 @@ nc_rpc_get(const char *filter, NC_WD_MODE wd_mode, NC_PARAMTYPE paramtype)
     struct nc_rpc_get *rpc;
 
     if (filter && filter[0] && (filter[0] != '<') && (filter[0] != '/') && !isalpha(filter[0])) {
-        ERR("Filter must either be an XML subtree or an XPath expression (invalid first char '%c').", filter[0]);
+        ERR("Filter is neither an XML subtree nor an XPath expression (invalid first char '%c').", filter[0]);
         return NULL;
     }
 
@@ -410,7 +411,7 @@ nc_rpc_validate(NC_DATASTORE source, const char *url_or_config, NC_PARAMTYPE par
         return NULL;
     }
 
-    if (url_or_config && (url_or_config[0] != '<') && !isalpha(url_or_config[0])) {
+    if (url_or_config && url_or_config[0] && (url_or_config[0] != '<') && !isalpha(url_or_config[0])) {
         ERR("<validate> source is neither a URL nor an XML config (invalid first char '%c').", url_or_config[0]);
         return NULL;
     }
@@ -477,7 +478,7 @@ nc_rpc_subscribe(const char *stream_name, const char *filter, const char *start_
     struct nc_rpc_subscribe *rpc;
 
     if (filter && filter[0] && (filter[0] != '<') && (filter[0] != '/') && !isalpha(filter[0])) {
-        ERR("Filter must either be an XML subtree or an XPath expression (invalid first char '%c').", filter[0]);
+        ERR("Filter is neither an XML subtree nor an XPath expression (invalid first char '%c').", filter[0]);
         return NULL;
     }
 
@@ -516,7 +517,7 @@ nc_rpc_subscribe(const char *stream_name, const char *filter, const char *start_
 API void
 nc_rpc_free(struct nc_rpc *rpc)
 {
-    struct nc_rpc_generic *rpc_generic;
+    struct nc_rpc_act_generic *rpc_generic;
     struct nc_rpc_getconfig *rpc_getconfig;
     struct nc_rpc_edit *rpc_edit;
     struct nc_rpc_copy *rpc_copy;
@@ -533,8 +534,8 @@ nc_rpc_free(struct nc_rpc *rpc)
     }
 
     switch (rpc->type) {
-    case NC_RPC_GENERIC:
-        rpc_generic = (struct nc_rpc_generic *)rpc;
+    case NC_RPC_ACT_GENERIC:
+        rpc_generic = (struct nc_rpc_act_generic *)rpc;
         if (rpc_generic->free) {
             if (rpc_generic->has_data) {
                 lyd_free(rpc_generic->content.data);
@@ -559,6 +560,7 @@ nc_rpc_free(struct nc_rpc *rpc)
         rpc_copy = (struct nc_rpc_copy *)rpc;
         if (rpc_copy->free) {
             free(rpc_copy->url_config_src);
+            free(rpc_copy->url_trg);
         }
         break;
     case NC_RPC_DELETE:
@@ -618,11 +620,48 @@ nc_rpc_free(struct nc_rpc *rpc)
 }
 
 API void
+nc_client_err_clean(struct nc_err *err, struct ly_ctx *ctx)
+{
+    int i;
+
+    assert(ctx);
+
+    if (!err) {
+        return;
+    }
+
+    lydict_remove(ctx, err->type);
+    lydict_remove(ctx, err->tag);
+    lydict_remove(ctx, err->severity);
+    lydict_remove(ctx, err->apptag);
+    lydict_remove(ctx, err->path);
+    lydict_remove(ctx, err->message);
+    lydict_remove(ctx, err->message_lang);
+    lydict_remove(ctx, err->sid);
+    for (i = 0; i < err->attr_count; ++i) {
+        lydict_remove(ctx, err->attr[i]);
+    }
+    free(err->attr);
+    for (i = 0; i < err->elem_count; ++i) {
+        lydict_remove(ctx, err->elem[i]);
+    }
+    free(err->elem);
+    for (i = 0; i < err->ns_count; ++i) {
+        lydict_remove(ctx, err->ns[i]);
+    }
+    free(err->ns);
+    for (i = 0; i < err->other_count; ++i) {
+        lyxml_free(ctx, err->other[i]);
+    }
+    free(err->other);
+}
+
+API void
 nc_reply_free(struct nc_reply *reply)
 {
     struct nc_client_reply_error *error;
     struct nc_reply_data *data;
-    uint32_t i, j;
+    uint32_t i;
 
     if (!reply) {
         return;
@@ -641,30 +680,7 @@ nc_reply_free(struct nc_reply *reply)
     case NC_RPL_ERROR:
         error = (struct nc_client_reply_error *)reply;
         for (i = 0; i < error->count; ++i) {
-            lydict_remove(error->ctx, error->err[i].type);
-            lydict_remove(error->ctx, error->err[i].tag);
-            lydict_remove(error->ctx, error->err[i].severity);
-            lydict_remove(error->ctx, error->err[i].apptag);
-            lydict_remove(error->ctx, error->err[i].path);
-            lydict_remove(error->ctx, error->err[i].message);
-            lydict_remove(error->ctx, error->err[i].message_lang);
-            lydict_remove(error->ctx, error->err[i].sid);
-            for (j = 0; j < error->err[i].attr_count; ++j) {
-                lydict_remove(error->ctx, error->err[i].attr[j]);
-            }
-            free(error->err[i].attr);
-            for (j = 0; j < error->err[i].elem_count; ++j) {
-                lydict_remove(error->ctx, error->err[i].elem[j]);
-            }
-            free(error->err[i].elem);
-            for (j = 0; j < error->err[i].ns_count; ++j) {
-                lydict_remove(error->ctx, error->err[i].ns[j]);
-            }
-            free(error->err[i].ns);
-            for (j = 0; j < error->err[i].other_count; ++j) {
-                lyxml_free(error->ctx, error->err[i].other[j]);
-            }
-            free(error->err[i].other);
+            nc_client_err_clean(&error->err[i], error->ctx);
         }
         free(error->err);
         break;

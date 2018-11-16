@@ -1,0 +1,83 @@
+Name: @PACKAGE_NAME@
+Version: @LIBNETCONF2_VERSION@
+Release: 0
+Summary: Libnetconf2 library
+Url: https://github.com/CESNET/libnetconf2
+Source: %{url}/archive/@BRANCH@.tar.gz
+License: BSD-3-Clause
+BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}
+
+Requires:  libyang@COMPAT_PACKAGES@
+BuildRequires:  libyang@COMPAT_PACKAGES@-devel
+BuildRequires:  libssh-devel >= 0.7.1
+BuildRequires:  openssl-devel
+BuildRequires:  valgrind
+BuildRequires:  cmake
+BuildRequires:  libcmocka-devel
+BuildRequires:  gcc
+%if 0%{?suse_version}
+BuildRequires:  timezone
+%endif
+
+%if 0%{?suse_version} + 0%{?fedora} > 0
+BuildRequires:  python3-devel
+%else
+BuildRequires:  python34-devel
+%endif
+Conflicts: @CONFLICT_PACKAGE_NAME@
+
+%package devel
+Summary:    Headers of libnetconf2 library
+Requires:   %{name} = %{version}-%{release}
+Requires:   libssh-devel
+
+%package -n python3-netconf2@COMPAT_PACKAGES@
+Summary:    Bindings to python3
+Requires:   %{name} = %{version}-%{release}
+
+%description devel
+Headers of libnetconf2 library.
+
+%description -n python3-netconf2@COMPAT_PACKAGES@
+Bindings of libnetconf2 library to python3 language.
+
+%description
+Libnetconf2 is a NETCONF library in C intended for building NETCONF clients and servers.
+
+%prep
+%setup -n libnetconf2-@BRANCH@
+
+%build
+cmake -DCMAKE_INSTALL_PREFIX:PATH=/usr -DCMAKE_BUILD_TYPE:String="@BUILD_TYPE@" -DENABLE_PYTHON=ON -DENABLE_VALGRIND_TESTS:BOOL=FALSE .
+make
+
+%check
+ctest --output-on-failure
+
+%install
+make DESTDIR=%{buildroot} install
+
+%post -p /sbin/ldconfig
+
+%postun -p /sbin/ldconfig
+
+%files
+%defattr(-,root,root)
+%{_libdir}/libnetconf2.so.*
+%{_datadir}/libnetconf2/*
+%dir %{_datadir}/libnetconf2/
+
+%files devel
+%defattr(-,root,root)
+%{_libdir}/libnetconf2.so
+%{_libdir}/pkgconfig/libnetconf2.pc
+%{_includedir}/libnetconf2/*
+%{_includedir}/nc_client.h
+%{_includedir}/nc_server.h
+%dir %{_includedir}/libnetconf2/
+
+%files -n python3-netconf2@COMPAT_PACKAGES@
+%defattr(-,root,root)
+/usr/lib*/python*/*-packages/*
+
+%changelog

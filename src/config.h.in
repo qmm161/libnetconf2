@@ -3,7 +3,7 @@
  * \author Radek Krejci <rkrejci@cesnet.cz>
  * \brief libnetconf2 various configuration settings.
  *
- * Copyright (c) 2015 CESNET, z.s.p.o.
+ * Copyright (c) 2015 - 2017 CESNET, z.s.p.o.
  *
  * This source code is licensed under BSD 3-Clause License (the "License").
  * You may not use this file except in compliance with the License.
@@ -16,9 +16,11 @@
 #define NC_CONFIG_H_
 
 /*
- * Mark all objects as hidden and export only objects explicitly marked to be part of the public API.
+ * Mark all objects as hidden and export only objects explicitly marked to be part of the public API or
+ * those marked as mock objects for testing purpose
  */
 #define API __attribute__((visibility("default")))
+#define MOCK __attribute__((visibility("default")))
 
 #ifdef __GNUC__
 #  define UNUSED(x) UNUSED_ ## x __attribute__((__unused__))
@@ -27,13 +29,43 @@
 #endif
 
 /*
- * Location of installed basic YIN/YANG schemas
+ * Support for atomic variables
  */
-#define SCHEMAS_DIR "@CMAKE_INSTALL_PREFIX@/@DATA_INSTALL_DIR@"
+#cmakedefine HAVE_STDATOMIC
+#ifdef HAVE_STDATOMIC
+# include <stdatomic.h>
+
+# define ATOMIC_UINT32_T atomic_uint_fast32_t
+# define ATOMIC_INC(x) atomic_fetch_add(x, 1)
+#else
+# define ATOMIC_UINT32_T uint32_t
+# define ATOMIC_INC(x) __sync_add_and_fetch(x, 1)
+#endif
 
 /*
- * Partial message read timeout in seconds (also used as nc_pollsession lock timeout)
+ * support for pthread_mutex_timedlock
  */
-#define NC_READ_TIMEOUT @READ_TIMEOUT@
+#cmakedefine HAVE_PTHREAD_MUTEX_TIMEDLOCK
+
+/*
+ * Location of installed basic YIN/YANG schemas
+ */
+#define NC_SCHEMAS_DIR "@SCHEMAS_DIR@"
+
+/*
+ * Inactive read timeout
+ */
+#define NC_READ_INACT_TIMEOUT @READ_INACTIVE_TIMEOUT@
+
+/*
+ * Active read timeout in seconds
+ * (also used for internal <get-schema> RPC reply timeout)
+ */
+#define NC_READ_ACT_TIMEOUT @READ_ACTIVE_TIMEOUT@
+
+/*
+ * pspoll structure queue size (also found in nc_server.h)
+ */
+#define NC_PS_QUEUE_SIZE @MAX_PSPOLL_THREAD_COUNT@
 
 #endif /* NC_CONFIG_H_ */
